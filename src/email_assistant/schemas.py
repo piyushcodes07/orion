@@ -2,6 +2,8 @@ from datetime import datetime
 from operator import add
 from typing import Optional
 from typing  import Annotated, TypedDict, Literal
+from langchain_core.messages.utils import AnyMessage
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 from langgraph.graph import MessagesState
 
@@ -29,11 +31,12 @@ class StateInput(TypedDict):
     email_input: dict
     classification_decision: Literal["ignore", "respond", "notify"]
     task_input: str | None
+    task_messages:Annotated[list[AnyMessage],add_messages]
 
 class State(MessagesState):
     # This state class has the messages key built in
     email_input: dict
-    task_messages:Annotated[list,add]
+    task_messages:Annotated[list[AnyMessage],add_messages]
     classification_decision: Literal["ignore", "respond", "notify"]
     task_input: str | None
 
@@ -69,6 +72,10 @@ class Profile(BaseModel):
     connections: list[str] = Field(
         description="Personal connections of the user, such as family, friends, or coworkers",
         default_factory=list,
+    )
+    email:Optional[str] = Field(
+        description="primary email of the user",
+        default=None
     )
     interests: list[str] = Field(
         description="Interests that the user has",

@@ -1,5 +1,6 @@
 from typing import Literal
 from langchain_core.messages.tool import ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 
 from langchain.chat_models import init_chat_model
@@ -7,7 +8,9 @@ from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, START, END
 from langgraph.store.base import BaseStore
 from langgraph.types import interrupt, Command
+from langgraph.utils.runnable import RunnableLike
 
+import email_assistant.configuration as configuration
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.gmail.prompt_templates import GMAIL_TOOLS_PROMPT
 from email_assistant.tools.gmail.gmail_tools import mark_as_read
@@ -29,16 +32,18 @@ llm_router = llm.with_structured_output(RouterSchema)
 llm = init_chat_model("openai:gpt-4.1", temperature=0.0)
 llm_with_tools = llm.bind_tools(tools, tool_choice="required")
 
-def get_memory(store, namespace, default_content=None):
+def get_memory(store, namespace,default_content=None,):
     """Get memory from the store or initialize with default if it doesn't exist.
 
     Args:
         store: LangGraph BaseStore instance to search for existing memory
         namespace: Tuple defining the memory namespace, e.g. ("email_assistant", "triage_preferences")
+
         default_content: Default content to use if memory doesn't exist
 
     Returns:
         str: The content of the memory profile, either from existing memory or the default
+
     """
     # Search for existing memory with namespace and key
     user_preferences = store.get(namespace, "user_preferences")
@@ -65,7 +70,7 @@ def update_memory(store, namespace, messages):
         messages: List of messages to update the memory with
     """
 
-    # Get the existing memory
+    # Get the existing mem
     user_preferences = store.get(namespace, "user_preferences")
     # Update the memory
     llm = init_chat_model("openai:gpt-4.1", temperature=0.0).with_structured_output(UserPreferences)
@@ -78,7 +83,7 @@ def update_memory(store, namespace, messages):
     store.put(namespace, "user_preferences", result.user_preferences)
 
 # Nodes
-def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router(state: State, store: BaseStore,config:RunnableConfig) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -86,7 +91,8 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
     - Company-wide announcements
     - Messages meant for other teams
     """
-
+    configurable = configuration.Configuration.from_runnable_config(config)
+    user_id = configurable.user_id
     # Parse the email input
     author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
     user_prompt = triage_user_prompt.format(
@@ -97,7 +103,7 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
 
     # Search for existing triage_preferences memory
-    triage_instructions = get_memory(store, ("email_assistant", "triage_preferences"), default_triage_instructions)
+    triage_instructions = get_memory(store, ( "triage_preferences",user_id), default_triage_instructions)
 
     # Format system prompt with background and triage instructions
     system_prompt = triage_system_prompt.format(
@@ -154,9 +160,10 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
 
     return Command(goto=goto, update=update)
 
-def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler(state: State, store: BaseStore,config:RunnableConfig) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
-
+    configurable = configuration.Configuration.from_runnable_config(config)
+    user_id = configurable.user_id
     author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
 
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
@@ -193,7 +200,7 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
                         "content": f"User wants to reply to the email. Use this feedback to respond: {user_input}"
                         })
         # Update memory with feedback
-        update_memory(store, ("email_assistant", "triage_preferences"), [{
+        update_memory(store, ("triage_preferences",user_id), [{
             "role": "user",
             "content": f"The user decided to respond to the email, so update the triage preferences to capture this."
         }] + messages)
@@ -207,7 +214,7 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
                         "content": f"The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."
                         })
         # Update memory with feedback
-        update_memory(store, ("email_assistant", "triage_preferences"), messages)
+        update_memory(store, ("email_assistant", "triage_preferences"), messages,user_id)
         goto = END
 
     # Catch all other responses
@@ -221,14 +228,17 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
 
     return Command(goto=goto, update=update)
 
-def llm_call(state: State, store: BaseStore):
+def llm_call(state: State, store: BaseStore,config:RunnableConfig):
     """LLM decides whether to call a tool or not"""
 
     # Search for existing cal_preferences memory
-    cal_preferences = get_memory(store, ("email_assistant", "cal_preferences"), default_cal_preferences)
+
+    configurable = configuration.Configuration.from_runnable_config(config)
+    user_id = configurable.user_id
+    cal_preferences = get_memory(store, ( "cal_preferences",user_id), default_cal_preferences)
 
     # Search for existing response_preferences memory
-    response_preferences = get_memory(store, ("email_assistant", "response_preferences"), default_response_preferences)
+    response_preferences = get_memory(store, ( "response_preferences",user_id), default_response_preferences)
 
     return {
         "messages": [
@@ -246,7 +256,7 @@ def llm_call(state: State, store: BaseStore):
         ]
     }
 
-def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
+def interrupt_handler(state: State, store: BaseStore,config:RunnableConfig) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
 
     # Store messages
@@ -256,6 +266,9 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
     goto = "llm_call"
 
     # Iterate over the tool calls in the last message
+
+    configurable = configuration.Configuration.from_runnable_config(config)
+    user_id = configurable.user_id
     for tool_call in state["messages"][-1].tool_calls:
 
         # Allowed tools for HITL
@@ -281,21 +294,21 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
 
         # Configure what actions are allowed in Agent Inbox
         if tool_call["name"] == "send_email_tool":
-            config = {
+            configg= {
                 "allow_ignore": True,
                 "allow_respond": True,
                 "allow_edit": True,
                 "allow_accept": True,
             }
         elif tool_call["name"] == "schedule_meeting_tool":
-            config = {
+            configg = {
                 "allow_ignore": True,
                 "allow_respond": True,
                 "allow_edit": True,
                 "allow_accept": True,
             }
         elif tool_call["name"] == "Question":
-            config = {
+            configg ={
                 "allow_ignore": True,
                 "allow_respond": True,
                 "allow_edit": False,
@@ -310,7 +323,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 "action": tool_call["name"],
                 "args": tool_call["args"]
             },
-            "config": config,
+            "config": configg,
             "description": description,
         }
 
@@ -358,7 +371,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
 
                 # This is new: update the memory
-                update_memory(store, ("email_assistant", "response_preferences"), [{
+                update_memory(store, ( "response_preferences",user_id), [{
                     "role": "user",
                     "content": f"User edited the email response. Here is the initial email generated by the assistant: {initial_tool_call}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
@@ -373,7 +386,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
 
                 # This is new: update the memory
-                update_memory(store, ("email_assistant", "cal_preferences"), [{
+                update_memory(store, ( "cal_preferences",user_id), [{
                     "role": "user",
                     "content": f"User edited the calendar invitation. Here is the initial calendar invitation generated by the assistant: {initial_tool_call}. Here is the edited calendar invitation: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
@@ -390,7 +403,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 # Go to END
                 goto = END
                 # This is new: update the memory
-                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{
+                update_memory(store, ( "triage_preferences",user_id), state["messages"] + result + [{
                     "role": "user",
                     "content": f"The user ignored the email draft. That means they did not want to respond to the email. Update the triage preferences to ensure emails of this type are not classified as respond. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
@@ -401,7 +414,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 # Go to END
                 goto = END
                 # This is new: update the memory
-                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{
+                update_memory(store, ("triage_preferences",user_id), state["messages"] + result + [{
                     "role": "user",
                     "content": f"The user ignored the calendar meeting draft. That means they did not want to schedule a meeting for this email. Update the triage preferences to ensure emails of this type are not classified as respond. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
@@ -412,7 +425,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 # Go to END
                 goto = END
                 # This is new: update the memory
-                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{
+                update_memory(store, ( "triage_preferences",user_id), state["messages"] + result + [{
                     "role": "user",
                     "content": f"The user ignored the Question. That means they did not want to answer the question or deal with this email. Update the triage preferences to ensure emails of this type are not classified as respond. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
@@ -426,17 +439,15 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
             if tool_call["name"] == "send_email_tool":
                 # Don't execute the tool, and add a message with the user feedback to incorporate into the email
                 result.append({"role": "tool", "content": f"User gave feedback, which can we incorporate into the email. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
-                # This is new: update the memory
-                update_memory(store, ("email_assistant", "response_preferences"), state["messages"] + result + [{
+                update_memory(store, ("response_preferences",user_id), state["messages"] + result + [{
                     "role": "user",
                     "content": f"User gave feedback, which we can use to update the response preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
-
             elif tool_call["name"] == "schedule_meeting_tool":
                 # Don't execute the tool, and add a message with the user feedback to incorporate into the email
                 result.append({"role": "tool", "content": f"User gave feedback, which can we incorporate into the meeting request. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
                 # This is new: update the memory
-                update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{
+                update_memory(store, ( "cal_preferences",user_id), state["messages"] + result + [{
                     "role": "user",
                     "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."
                 }])
@@ -515,7 +526,7 @@ response_agent = agent_builder.compile()
 
 # Build overall workflow with store and checkpointer
 overall_workflow = (
-    StateGraph(State, input=StateInput)
+    StateGraph(State, input=StateInput,config_schema=configuration.Configuration)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)

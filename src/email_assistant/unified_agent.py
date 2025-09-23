@@ -3,6 +3,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.store.base import BaseStore
 
 # Import Gmail Assistant + ToDo Agent
+from email_assistant import configuration
 from email_assistant.email_assistant_hitl_memory_gmail import email_assistant # compiled workflow
 from email_assistant.task_maistro import graph as todo_agent  # compiled workflow
 from email_assistant.schemas import State as GmailState        # Gmail schema (already extends MessagesState)
@@ -11,7 +12,7 @@ def entry_router(state: GmailState, store: BaseStore) -> Literal["email_assistan
     """Route based on the very first input"""
     if state.get("email_input"):
         return "email_assistant"
-    elif state.get("task_input") or state.get("messages"):
+    elif len(state.get("task_messages"))>0:
         return "todo_agent"
     else:
         raise ValueError("Invalid entry: must contain either email_input or task_input/messages")
@@ -29,7 +30,7 @@ def email_to_todo_bridge(state: GmailState, store: BaseStore):
     }
 
 
-builder = StateGraph(GmailState)
+builder = StateGraph(GmailState,config_schema=configuration.Configuration)
 
 builder.add_conditional_edges(
     START,

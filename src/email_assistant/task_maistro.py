@@ -1,12 +1,14 @@
+from email_assistant.schemas import Profile,ToDo
 import uuid
 from datetime import datetime
 
+from langchain_core.messages.tool import ToolMessage
 from pydantic import BaseModel, Field
 
 from trustcall import create_extractor
-
+from email_assistant.tools.gmail.gmail_tools import fetch_emails_tool,send_email_tool,check_calendar_tool,schedule_meeting_tool
 from typing import Literal, Optional, TypedDict
-
+from email_assistant.tools import get_tools
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import merge_message_runs
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -98,44 +100,15 @@ def extract_tool_info(tool_calls, schema_name="Memory"):
 ## Schema definitions
 
 # User profile schema
-class Profile(BaseModel):
-    """This is the profile of the user you are chatting with"""
-    name: Optional[str] = Field(description="The user's name", default=None)
-    location: Optional[str] = Field(description="The user's location", default=None)
-    job: Optional[str] = Field(description="The user's job", default=None)
-    connections: list[str] = Field(
-        description="Personal connection of the user, such as family members, friends, or coworkers",
-        default_factory=list
-    )
-    interests: list[str] = Field(
-        description="Interests that the user has",
-        default_factory=list
-    )
-
-# ToDo schema
-class ToDo(BaseModel):
-    task: str = Field(description="The task to be completed.")
-    time_to_complete: Optional[int] = Field(description="Estimated time to complete the task (minutes).")
-    deadline: Optional[datetime] = Field(
-        description="When the task needs to be completed by (if applicable)",
-        default=None
-    )
-    solutions: list[str] = Field(
-        description="List of specific, actionable solutions (e.g., specific ideas, service providers, or concrete options relevant to completing the task)",
-        min_items=1,
-        default_factory=list
-    )
-    status: Literal["not started", "in progress", "done", "archived"] = Field(
-        description="Current status of the task",
-        default="not started"
-    )
 
 ## Initialize the model and tools
 
 # Update memory tool
-class UpdateMemory(TypedDict):
-    """ Decision on what memory type to update """
-    update_type: Literal['user', 'todo', 'instructions']
+class UpdateMemory(BaseModel):
+    """Decision on what memory type to update"""
+    update_type: Literal['user', 'todo', 'instructions'] = Field(
+        description="Specify whether to update user profile, todo list, or instructions"
+    )
 
 # Initialize the model
 model = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -171,7 +144,9 @@ Here are the current user-specified preferences for updating the ToDo list (may 
 <instructions>
 {instructions}
 </instructions>
-
+<current time>
+{current_time}
+</current time>
 Here are your instructions for reasoning about the user's messages:
 
 1. Reason carefully about the user's messages as presented below.
@@ -188,7 +163,13 @@ Here are your instructions for reasoning about the user's messages:
 
 4. Err on the side of updating the todo list. No need to ask for explicit permission.
 
-5. Respond naturally to user user after a tool call was made to save memories, or if no tool call was made."""
+5. Respond naturally to user user after a tool call was made to save memories, or if no tool call was made.
+
+6. you also have access to tools like [fetch_emails_tool, send_email_tool, check_calendar_tool, schedule_meeting_tool] use of them if needed to answer users query, you can also suggest user to use a tool after creating a todo, liking scheduling meetings and sending invites is also important.
+make sure that you have enough info from user to make a tool_call, ask user questions till you are not sure!
+"""
+
+
 
 # Trustcall instruction
 TRUSTCALL_INSTRUCTION = """Reflect on following interaction.
@@ -213,8 +194,8 @@ Your current instructions are:
 ## Node definitions
 
 def task_mAIstro(state: State, config: RunnableConfig, store: BaseStore):
-
     """Load memories from the store and use them to personalize the chatbot's response."""
+    external_tools = get_tools(["send_email_tool", "schedule_meeting_tool", "check_calendar_tool",], include_gmail=True)
 
     # Get the user ID from the config
     configurable = configuration.Configuration.from_runnable_config(config)
@@ -243,10 +224,10 @@ def task_mAIstro(state: State, config: RunnableConfig, store: BaseStore):
     else:
         instructions = ""
 
-    system_msg = MODEL_SYSTEM_MESSAGE.format(task_maistro_role=task_maistro_role, user_profile=user_profile, todo=todo, instructions=instructions)
+    system_msg = MODEL_SYSTEM_MESSAGE.format(task_maistro_role=task_maistro_role,current_time=datetime.now(), user_profile=user_profile, todo=todo, instructions=instructions)
 
     # Respond using memory as well as the chat history
-    response = model.bind_tools([UpdateMemory], parallel_tool_calls=False).invoke([SystemMessage(content=system_msg)]+state["task_messages"])
+    response = model.bind_tools([UpdateMemory,fetch_emails_tool, send_email_tool, check_calendar_tool, schedule_meeting_tool], parallel_tool_calls=False).invoke([SystemMessage(content=system_msg)]+state["task_messages"])
 
     return {"task_messages": [response]}
 
@@ -372,16 +353,46 @@ def update_instructions(state: State, config: RunnableConfig, store: BaseStore):
     # Return tool message with update verification
     return {"task_messages": [{"role": "tool", "content": "updated instructions", "tool_call_id":tool_calls[0]['id']}]}
 
+def tool_executor_node(state:State ):
+    """
+    Executes the right tool depending on the last tool call in task_messages.
+    """
+    tool_call = state["task_messages"][-1]  # expecting last message to be a tool call
+    tool_call = tool_call.tool_calls[0]
+    tool_name = tool_call["name"]
+    args = tool_call["args"]
+
+    if tool_name == "fetch_emails_tool":
+        result = fetch_emails_tool.invoke(tool_call['args'])
+    elif tool_name == "send_email_tool":
+        result = send_email_tool.invoke(tool_call['args'])
+    elif tool_name == "check_calendar_tool":
+        result = check_calendar_tool.invoke(tool_call['args'])
+    elif tool_name == "schedule_meeting_tool":
+        result = schedule_meeting_tool.invoke(tool_call['args'])
+    else:
+        result = {"error": f"Unknown tool {tool_name}"}
+
+    tool_msg = ToolMessage(
+        content=str(result),
+        tool_call_id=tool_call["id"],  # match original tool call id
+    )
+
+    return {"task_messages": state["task_messages"] + [tool_msg]}
 # Conditional edge
-def route_message(state:State , config: RunnableConfig, store: BaseStore) -> Literal[END, "update_todos", "update_instructions", "update_profile"]:
+def route_message(state:State , config: RunnableConfig, store: BaseStore) -> Literal[END, "update_todos", "update_instructions", "update_profile","tool_executor_node"]:
 
     """Reflect on the memories and chat history to decide whether to update the memory collection."""
     message = state['task_messages'][-1]
     if len(message.tool_calls) ==0:
         return END
     else:
+
         tool_call = message.tool_calls[0]
-        if tool_call['args']['update_type'] == "user":
+
+        if tool_call['name'] in ["fetch_emails_tool", "check_calendar_tool", "send_email_tool", "schedule_meeting_tool"]:
+            return "tool_executor_node"
+        elif tool_call['args']['update_type'] == "user":
             return "update_profile"
         elif tool_call['args']['update_type'] == "todo":
             return "update_todos"
@@ -398,13 +409,13 @@ builder.add_node(task_mAIstro)
 builder.add_node(update_todos)
 builder.add_node(update_profile)
 builder.add_node(update_instructions)
-
+builder.add_node(tool_executor_node)
 # Define the flow
 builder.add_edge(START, "task_mAIstro")
 builder.add_conditional_edges("task_mAIstro", route_message)
 builder.add_edge("update_todos", "task_mAIstro")
 builder.add_edge("update_profile", "task_mAIstro")
 builder.add_edge("update_instructions", "task_mAIstro")
-
+builder.add_edge("tool_executor_node","task_mAIstro")
 # Compile the graph
 graph = builder.compile()
