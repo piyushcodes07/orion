@@ -38,7 +38,7 @@ Orion is built using **LangGraph** to orchestrate a stateful, multi-agent system
 ![main agent](/main_agent.png)
 
 # email assitant
-![email assitant](/email_assistant.png)
+![email assitant](email_assitant.png)
 
 ## Tech Stack
 
