@@ -32,6 +32,14 @@ Orion is built using **LangGraph** to orchestrate a stateful, multi-agent system
 
 5.  **Adaptive Memory (RAG):** User feedback from the HITL process is used to update a knowledge base of "user preferences." Before taking any action, Orion retrieves relevant preferences from this memory, allowing it to personalize its behavior over time.
 
+## Agent diagrams
+
+# Main agent
+![main agent](/main_agent.png)
+
+# email assitant
+![email assitant](/email_assistant.png)
+
 ## Tech Stack
 
 -   **Backend:** Python
